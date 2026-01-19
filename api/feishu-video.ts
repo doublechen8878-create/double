@@ -1,97 +1,160 @@
+// 安全版接口：不依赖 next/server，使用 Node Serverless 风格 (req, res)
+// 文件放到：api/feishu-video.ts
+// 作用：
+// - GET：健康检查，直接返回 { msg: 'Service Running' }
+// - POST：读取请求体，严格校验 env，调用外部 API 都做 try/catch 和 res.ok 判断，失败时也返回 200 + 提示，不崩溃
 
-import { type NextRequest, NextResponse } from 'next/server';
+// 小提示：若你的项目仍报 “Cannot find module 'next/server'”，确保仓库不是 Next.js；
+// 当前写法适合 Vercel 的“Other + ./”最简项目结构。
 
-export const runtime = 'edge'; // 使用 Edge Runtime 避免超时
+export default async function handler(req: any, res: any) {
+  // 1) GET：浏览器直接访问用
+  if (req.method === 'GET') {
+    return res.status(200).json({ msg: 'Service Running' });
+  }
 
-export default async function handler(req: NextRequest) {
-  // 1. 预检请求处理
-  if (req.method === 'GET') return NextResponse.json({ msg: 'Service Running' });
-  
-  // 2. 解析请求体
-  const body = await req.json();
-  const { record_id, prompt, image_file_token, model } = body;
+  // 2) POST：完整安全流程
+  try {
+    // 2.1 读取 JSON 请求体（兼容飞书自动化 Raw JSON）
+    let body: any = req.body;
+    if (!body) {
+      body = await new Promise((resolve) => {
+        let data = '';
+        req.on('data', (chunk: Buffer) => (data += chunk.toString()));
+        req.on('end', () => {
+          try { resolve(JSON.parse(data || '{}')); } catch { resolve({}); }
+        });
+      });
+    }
 
-  console.log(`收到任务: ${record_id}, Prompt: ${prompt}`);
+    const { record_id, prompt, image_file_token, model } = body || {};
 
-  // 3. 定义后台任务 (WaitUntil 逻辑)
-  const processTask = async () => {
+    // 2.2 环境变量防呆（缺就返回提示，不抛错）
+    const envs = [
+      'FEISHU_APP_ID','FEISHU_APP_SECRET','BITABLE_APP_TOKEN',
+      'BITABLE_TABLE_ID','BITABLE_VIDEO_FIELD','VIDEO_API_BASE','VIDEO_API_KEY'
+    ];
+    const missing = envs.filter((k) => !process.env[k]);
+    if (missing.length) {
+      return res.status(200).json({ code: 1, msg: 'Missing env', detail: missing });
+    }
+
+    // 2.3 简单参数校验（兼容飞书自动化）
+    if (!record_id) {
+      return res.status(200).json({ code: 2, msg: 'Missing record_id' });
+    }
+    if (!prompt && !image_file_token) {
+      return res.status(200).json({ code: 3, msg: 'Missing prompt or image_file_token' });
+    }
+
+    // 2.4 获取飞书 tenant_access_token（严格判错）
+    let tenant_access_token = '';
     try {
-      // (A) 获取飞书 Tenant Token
       const tokenRes = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           app_id: process.env.FEISHU_APP_ID,
-          app_secret: process.env.FEISHU_APP_SECRET
-        })
+          app_secret: process.env.FEISHU_APP_SECRET,
+        }),
       });
-      const { tenant_access_token } = await tokenRes.json();
-      
-      // (B) 调用云雾视频 API
-      // 这里假设云雾 API 支持 image_file_token 或 URL。如果需要临时 URL，需额外调用飞书 drive API。
-      // 为简化，此处演示直接透传 token 或 prompt 调用
-      const videoRes = await fetch(`${process.env.VIDEO_API_BASE}/videos`, {
+      if (!tokenRes.ok) {
+        return res.status(200).json({ code: 4, msg: 'Feishu token fetch failed', status: tokenRes.status });
+      }
+      const tokenJson: any = await tokenRes.json().catch(() => ({}));
+      tenant_access_token = tokenJson?.tenant_access_token || '';
+      if (!tenant_access_token) {
+        return res.status(200).json({ code: 5, msg: 'No tenant_access_token in response' });
+      }
+    } catch (e: any) {
+      return res.status(200).json({ code: 6, msg: 'Feishu token exception', detail: e?.message || String(e) });
+    }
+
+    // 2.5 调用视频生成 API（严格判错）
+    const apiBase = String(process.env.VIDEO_API_BASE || '').replace(/\/$/, '');
+    const apiKey = process.env.VIDEO_API_KEY as string;
+
+    let taskId = '';
+    try {
+      const videoRes = await fetch(`${apiBase}/videos`, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${process.env.VIDEO_API_KEY}`,
-          'Content-Type': 'application/json'
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: model || 'kling-v1', // 默认模型
-          prompt: prompt,
-          image: image_file_token // 视具体 API 定义，可能需要换成 URL
-        })
+          model: model || 'kling-v1',
+          prompt,
+          image: image_file_token,
+        }),
       });
-      
-      const videoData = await videoRes.json();
-      const taskId = videoData.id || videoData.task_id;
-      
-      if (! taskId) throw new Error('未获取到视频任务 ID');
+      if (!videoRes.ok) {
+        return res.status(200).json({ code: 7, msg: 'Video API create failed', status: videoRes.status });
+      }
+      const videoJson: any = await videoRes.json().catch(() => ({}));
+      taskId = videoJson?.id || videoJson?.task_id || '';
+      if (!taskId) {
+        return res.status(200).json({ code: 8, msg: 'No taskId returned from video API' });
+      }
+    } catch (e: any) {
+      return res.status(200).json({ code: 9, msg: 'Video API exception (create)', detail: e?.message || String(e) });
+    }
 
-      // (C) 轮询等待结果 (最多轮询 5 分钟)
-      let videoUrl = '';
+    // 2.6 轮询任务结果（最多 5 分钟，每 5 秒一次；严格判错）
+    let videoUrl = '';
+    try {
       for (let i = 0; i < 60; i++) {
-        await new Promise(r => setTimeout(r, 5000)); // 等 5 秒
-        const checkRes = await fetch(`${process.env.VIDEO_API_BASE}/videos/${taskId}`, {
-          headers: { 'Authorization': `Bearer ${process.env.VIDEO_API_KEY}` }
+        await new Promise((r) => setTimeout(r, 5000));
+        const checkRes = await fetch(`${apiBase}/videos/${taskId}`, {
+          headers: { 'Authorization': `Bearer ${apiKey}` },
         });
-        const checkData = await checkRes.json();
-        
-        if (checkData.status === 'succeeded' || checkData.state === 'succeeded') {
-          videoUrl = checkData.url || checkData.result_url;
+        if (!checkRes.ok) {
+          // 不中断，继续下一轮；也可以选择直接返回
+          continue;
+        }
+        const checkJson: any = await checkRes.json().catch(() => ({}));
+        const status = checkJson?.status || checkJson?.state;
+        if (status === 'succeeded') {
+          videoUrl = checkJson?.url || checkJson?.result_url || '';
           break;
         }
-        if (checkData.status === 'failed') break;
+        if (status === 'failed') {
+          break;
+        }
       }
+    } catch (e: any) {
+      // 不中断整个流程，最后统一返回
+    }
 
-      // (D) 写回飞书多维表格
-      if (videoUrl) {
-        await fetch(`https://open.feishu.cn/open-apis/bitable/v1/apps/${process.env.BITABLE_APP_TOKEN}/tables/${process.env.BITABLE_TABLE_ID}/records/${record_id}`, {
+    // 2.7 成功则写回飞书多维表格（严格判错）
+    if (videoUrl) {
+      try {
+        const putRes = await fetch(`https://open.feishu.cn/open-apis/bitable/v1/apps/${process.env.BITABLE_APP_TOKEN}/tables/${process.env.BITABLE_TABLE_ID}/records/${record_id}`, {
           method: 'PUT',
           headers: {
             'Authorization': `Bearer ${tenant_access_token}`,
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
           },
           body: JSON.stringify({
             fields: {
-              [process.env.BITABLE_VIDEO_FIELD]: { text: videoUrl, link: videoUrl }
-            }
-          })
+              [String(process.env.BITABLE_VIDEO_FIELD)]: { text: videoUrl, link: videoUrl },
+            },
+          }),
         });
-        console.log('写回成功');
+        if (!putRes.ok) {
+          // 写回失败也不要崩，返回提示即可
+          return res.status(200).json({ code: 10, msg: 'Writeback failed', status: putRes.status, videoUrl });
+        }
+      } catch (e: any) {
+        return res.status(200).json({ code: 11, msg: 'Writeback exception', detail: e?.message || String(e), videoUrl });
       }
-
-    } catch (err) {
-      console.error('后台任务出错:', err);
+      return res.status(200).json({ code: 0, msg: 'Succeeded', videoUrl });
     }
-  };
 
-  // 4. 触发后台任务并立即返回 200
-  // @ts-ignore
-  if (req.after) req.after(processTask()); // Vercel Edge 兼容写法
-  // @ts-ignore
-  else if (context?.waitUntil) context.waitUntil(processTask());
-  else processTask(); // 降级处理
-
-  return NextResponse.json({ code: 0, msg: "Task accepted, processing in background" });
+    // 2.8 未成功生成则返回任务信息（不崩）
+    return res.status(200).json({ code: 12, msg: 'Task not completed within 5min', taskId });
+  } catch (err: any) {
+    // 兜底：任何异常都以 200 返回，避免 500
+    return res.status(200).json({ code: 13, msg: 'Caught top-level error', detail: err?.message || String(err) });
+  }
 }
