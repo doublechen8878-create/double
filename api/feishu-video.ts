@@ -1,13 +1,8 @@
-// 安全版接口：不依赖 next/server，使用 Node Serverless 风格 (req, res)
-// 文件放到：api/feishu-video.ts
-// 作用：
-// - GET：健康检查，直接返回 { msg: 'Service Running' }
-// - POST：读取请求体，严格校验 env，调用外部 API 都做 try/catch 和 res.ok 判断，失败时也返回 200 + 提示，不崩溃
+// 安全版接口（JavaScript版）：不依赖 next/server，适配 Vercel “Other + ./” 项目
+// 使用 CommonJS 导出，避免 TypeScript/@types/node 的构建报错
+// 文件建议放到：api/feishu-video.js
 
-// 小提示：若你的项目仍报 “Cannot find module 'next/server'”，确保仓库不是 Next.js；
-// 当前写法适合 Vercel 的“Other + ./”最简项目结构。
-
-export default async function handler(req: any, res: any) {
+module.exports = async function handler(req, res) {
   // 1) GET：浏览器直接访问用
   if (req.method === 'GET') {
     return res.status(200).json({ msg: 'Service Running' });
@@ -16,11 +11,11 @@ export default async function handler(req: any, res: any) {
   // 2) POST：完整安全流程
   try {
     // 2.1 读取 JSON 请求体（兼容飞书自动化 Raw JSON）
-    let body: any = req.body;
+    let body = req.body;
     if (!body) {
       body = await new Promise((resolve) => {
         let data = '';
-        req.on('data', (chunk: Buffer) => (data += chunk.toString()));
+        req.on('data', (chunk) => (data += chunk.toString()));
         req.on('end', () => {
           try { resolve(JSON.parse(data || '{}')); } catch { resolve({}); }
         });
@@ -61,18 +56,18 @@ export default async function handler(req: any, res: any) {
       if (!tokenRes.ok) {
         return res.status(200).json({ code: 4, msg: 'Feishu token fetch failed', status: tokenRes.status });
       }
-      const tokenJson: any = await tokenRes.json().catch(() => ({}));
-      tenant_access_token = tokenJson?.tenant_access_token || '';
+      const tokenJson = await tokenRes.json().catch(() => ({}));
+      tenant_access_token = (tokenJson && tokenJson.tenant_access_token) || '';
       if (!tenant_access_token) {
         return res.status(200).json({ code: 5, msg: 'No tenant_access_token in response' });
       }
-    } catch (e: any) {
-      return res.status(200).json({ code: 6, msg: 'Feishu token exception', detail: e?.message || String(e) });
+    } catch (e) {
+      return res.status(200).json({ code: 6, msg: 'Feishu token exception', detail: e && e.message ? e.message : String(e) });
     }
 
     // 2.5 调用视频生成 API（严格判错）
     const apiBase = String(process.env.VIDEO_API_BASE || '').replace(/\/$/, '');
-    const apiKey = process.env.VIDEO_API_KEY as string;
+    const apiKey = process.env.VIDEO_API_KEY;
 
     let taskId = '';
     try {
@@ -91,13 +86,13 @@ export default async function handler(req: any, res: any) {
       if (!videoRes.ok) {
         return res.status(200).json({ code: 7, msg: 'Video API create failed', status: videoRes.status });
       }
-      const videoJson: any = await videoRes.json().catch(() => ({}));
-      taskId = videoJson?.id || videoJson?.task_id || '';
+      const videoJson = await videoRes.json().catch(() => ({}));
+      taskId = (videoJson && (videoJson.id || videoJson.task_id)) || '';
       if (!taskId) {
         return res.status(200).json({ code: 8, msg: 'No taskId returned from video API' });
       }
-    } catch (e: any) {
-      return res.status(200).json({ code: 9, msg: 'Video API exception (create)', detail: e?.message || String(e) });
+    } catch (e) {
+      return res.status(200).json({ code: 9, msg: 'Video API exception (create)', detail: e && e.message ? e.message : String(e) });
     }
 
     // 2.6 轮询任务结果（最多 5 分钟，每 5 秒一次；严格判错）
@@ -109,21 +104,20 @@ export default async function handler(req: any, res: any) {
           headers: { 'Authorization': `Bearer ${apiKey}` },
         });
         if (!checkRes.ok) {
-          // 不中断，继续下一轮；也可以选择直接返回
-          continue;
+          continue; // 下轮再试
         }
-        const checkJson: any = await checkRes.json().catch(() => ({}));
-        const status = checkJson?.status || checkJson?.state;
+        const checkJson = await checkRes.json().catch(() => ({}));
+        const status = (checkJson && (checkJson.status || checkJson.state)) || '';
         if (status === 'succeeded') {
-          videoUrl = checkJson?.url || checkJson?.result_url || '';
+          videoUrl = (checkJson && (checkJson.url || checkJson.result_url)) || '';
           break;
         }
         if (status === 'failed') {
           break;
         }
       }
-    } catch (e: any) {
-      // 不中断整个流程，最后统一返回
+    } catch (_) {
+      // 忽略轮询异常，最后统一返回
     }
 
     // 2.7 成功则写回飞书多维表格（严格判错）
@@ -142,19 +136,18 @@ export default async function handler(req: any, res: any) {
           }),
         });
         if (!putRes.ok) {
-          // 写回失败也不要崩，返回提示即可
           return res.status(200).json({ code: 10, msg: 'Writeback failed', status: putRes.status, videoUrl });
         }
-      } catch (e: any) {
-        return res.status(200).json({ code: 11, msg: 'Writeback exception', detail: e?.message || String(e), videoUrl });
+      } catch (e) {
+        return res.status(200).json({ code: 11, msg: 'Writeback exception', detail: e && e.message ? e.message : String(e), videoUrl });
       }
       return res.status(200).json({ code: 0, msg: 'Succeeded', videoUrl });
     }
 
     // 2.8 未成功生成则返回任务信息（不崩）
     return res.status(200).json({ code: 12, msg: 'Task not completed within 5min', taskId });
-  } catch (err: any) {
+  } catch (err) {
     // 兜底：任何异常都以 200 返回，避免 500
-    return res.status(200).json({ code: 13, msg: 'Caught top-level error', detail: err?.message || String(err) });
+    return res.status(200).json({ code: 13, msg: 'Caught top-level error', detail: err && err.message ? err.message : String(err) });
   }
-}
+};
